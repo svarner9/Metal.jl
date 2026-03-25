@@ -61,6 +61,11 @@ mutable struct MtlFFTPlan{T <: FFTNumber, S <: FFTNumber, backward, inplace, N, 
     output_size::NTuple{N, Int}
     region::NTuple{R, Int}
     pinv::ScaledPlan{T}
+    # Cached MPSGraph — built on the first mul! call, reused on all subsequent calls.
+    # Left undefined at construction (same pattern as `pinv`).
+    cached_graph::MPSGraph
+    input_tensor::MPSGraphTensor
+    output_tensor::MPSGraphTensor
 
     function MtlFFTPlan{T, S, backward, inplace, N, R}(input_size::NTuple{N, Int}, output_size::NTuple{N, Int}, region::NTuple{R, Int}) where {T <: FFTNumber, S <: FFTNumber, backward, inplace, N, R}
         # Validate region
@@ -189,6 +194,22 @@ end
 
 ## plan execution
 
+# Build the MPSGraph for plan `p` and store it in the plan's cache fields.
+# Called once on the first mul! and never again for the same plan instance.
+function _build_and_cache_graph!(f, p::MtlFFTPlan{T, S, backward, inplace, N},
+                                  x) where {T, S, backward, inplace, N}
+    graph = MPSGraph()
+    placeholder = placeholderTensor(graph, size(x), S)
+    fft_desc = MPSGraphFFTDescriptor(; inverse = backward)
+    # Julia 1-indexed axis i → Metal 0-indexed axis (N - i) due to shape reversal
+    axes = NSArray([NSNumber(Int(N - ax)) for ax in p.region])
+    fft_result = f(graph, placeholder, axes, fft_desc)
+    p.cached_graph  = graph
+    p.input_tensor  = placeholder
+    p.output_tensor = fft_result
+    return nothing
+end
+
 function assert_applicable(p::MtlFFTPlan{T, S}, X::MtlArray{S}) where {T, S}
     (size(X) == p.input_size) ||
         throw(ArgumentError("MtlFFT plan applied to wrong-size input"))
@@ -221,37 +242,23 @@ function unsafe_execute!(p::MtlFFTPlan{T, S, backward, inplace, N}, x::MtlArray{
 end
 
 @inline function _unsafe_execute!(f, p::MtlFFTPlan{T, S, backward, inplace, N}, x, y) where {T <: FFTNumber, S <: FFTNumber, N, backward, inplace}
-    graph = MPSGraph()
+    # Build and cache the MPSGraph on the first call; reuse it on every subsequent call.
+    if !isdefined(p, :cached_graph)
+        _build_and_cache_graph!(f, p, x)
+    end
 
-    # Create placeholder tensor
-    placeholder = placeholderTensor(graph, size(x), S)
-
-    # Create FFT descriptor - don't use MPSGraph scaling, AbstractFFTs handles it for us
-    fft_desc = MPSGraphFFTDescriptor(; inverse = backward)
-
-    # Convert Julia 1-indexed axis to Metal 0-indexed axis
-    # Due to shape reversal in placeholderTensor, we need to compute the correct axis
-    # Julia axis i -> Metal axis (N - i) for N-dimensional array
-    axes = NSArray([NSNumber(Int(N - ax)) for ax in p.region])
-
-    # Create FFT operation
-    fft_result = f(graph, placeholder, axes, fft_desc)
-
-    # feed dictionary
     feeds = Dict{MPSGraphTensor, MPSGraphTensorData}(
-        placeholder => MPSGraphTensorData(x)
+        p.input_tensor => MPSGraphTensorData(x)
     )
-
-    # result dictionary
     results = Dict{MPSGraphTensor, MPSGraphTensorData}(
-        fft_result => MPSGraphTensorData(y)
+        p.output_tensor => MPSGraphTensorData(y)
     )
 
-    # Execute
     cmdbuf = MPS.MPSCommandBuffer(Metal.global_queue(Metal.device()))
-    MPS.encode!(cmdbuf, graph, NSDictionary(feeds), NSDictionary(results), nil, MPSGraphs.default_exec_desc())
+    MPS.encode!(cmdbuf, p.cached_graph, NSDictionary(feeds), NSDictionary(results), nil, MPSGraphs.default_exec_desc())
     Metal.commit!(cmdbuf)
-    Metal.wait_completed(cmdbuf)
+    # wait_completed removed — Metal command queue guarantees in-order execution.
+    # CPU reads (Array()) block via their own copy buffer; Metal.synchronize() flushes the full queue.
 
     return y
 end
